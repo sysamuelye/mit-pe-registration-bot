@@ -1,0 +1,24 @@
+{
+  "timezone": "America/New_York",
+  "opens_at": "2026-10-07T08:00:00",
+  "term": "Q2 Fall 2026",
+  "waitlist_first_choice": true,
+  "choices": [
+    {
+      "section": "PE.0612-1",
+      "title": "Skate, Beginner",
+      "days": "MW",
+      "time": "1:00 PM",
+      "detail_schedule": "Mon, Wed 1:00 PM",
+      "max_fee": 20
+    },
+    {
+      "section": "PE.0612-2",
+      "title": "Skate, Beginner",
+      "days": "MW",
+      "time": "2:00 PM",
+      "detail_schedule": "Mon, Wed 2:00 PM",
+      "max_fee": 20
+    }
+  ]
+}
