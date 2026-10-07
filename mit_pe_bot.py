@@ -1,25 +1,14 @@
 #!/usr/bin/env python3
-"""MIT PE registration helper. Python 3.10+ and Playwright required.
-
-Install: python3 -m pip install playwright
-         python3 -m playwright install chromium
-Test:    python3 mit_pe_bot.py
-Run:     caffeinate -i python3 mit_pe_bot.py --arm
-
-Log in manually in the Chromium window this script opens, then press Enter
-in Terminal. Default mode only checks the section-list layout. --arm waits
-until 2026-10-07 08:00 America/New_York and attempts ONE enrollment.
-Keep the Mac awake, connected, and the browser open. Recheck login shortly
-before 8 AM. This local browser does not share ChatGPT's login session.
-
-LIMITATION: Q2 and its enrollment controls were unavailable during creation.
-Enrollment button names below are conservative candidates, not verified.
-Unknown controls, agreements, authentication, ambiguous outcomes, and both
-sections being full stop automation. No waitlist signup or repeated submit.
-The browser remains open for manual completion after every outcome.
+"""Reusable MIT PE registration helper for macOS and Windows.
+Edit config.json each registration period. Default mode only checks the page.
+Use --arm to wait for the configured opening; --arm --now starts immediately.
+Login manually in the opened browser. Enrollment and waitlist controls remain
+unverified on the live site; unfamiliar forms stop for manual completion.
 """
 
 import argparse
+import json
+from decimal import Decimal
 from contextlib import contextmanager
 from datetime import datetime
 import os
@@ -32,9 +21,41 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 HOME = 'https://eduapps.mit.edu/mitpe/student/registration/home'
-OPENING = datetime(2026, 10, 7, 8, tzinfo=ZoneInfo('America/New_York'))
-CHOICES = [('PE.0612-1', '1:00 PM'), ('PE.0612-2', '2:00 PM')]
 BASE = Path(__file__).resolve().parent
+SETTINGS = None
+OPENING = None
+
+
+def load_config(path):
+    cfg = json.loads(Path(path).read_text(encoding='utf-8'))
+    zone = ZoneInfo(cfg['timezone'])
+    naive = datetime.fromisoformat(cfg['opens_at'])
+    if naive.tzinfo is not None:
+        raise ValueError('opens_at must be local time without a UTC offset; use timezone.')
+    opening = naive.replace(tzinfo=zone)
+    if not isinstance(cfg['term'], str) or not cfg['term'].strip():
+        raise ValueError('term is required, e.g. Q2 Fall 2026.')
+    choices = cfg['choices']
+    if not isinstance(choices, list) or not choices:
+        raise ValueError('Add at least one choice.')
+    ids = set()
+    for choice in choices:
+        for key in ('section', 'title', 'days', 'time', 'detail_schedule', 'max_fee'):
+            if key not in choice:
+                raise ValueError(f'Missing choice field: {key}')
+        if not re.fullmatch(r'PE\.\d+-\d+', choice['section']) or choice['section'] in ids:
+            raise ValueError('Section IDs must be valid and unique.')
+        ids.add(choice['section'])
+        if any(not isinstance(choice[k], str) or not choice[k].strip()
+               for k in ('title', 'days', 'time', 'detail_schedule')):
+            raise ValueError('Title and schedule fields must be nonempty strings.')
+        fee = Decimal(str(choice['max_fee']))
+        if not fee.is_finite() or fee < 0:
+            raise ValueError('max_fee must be finite and nonnegative.')
+    if type(cfg.get('waitlist_first_choice', False)) is not bool:
+        raise ValueError('waitlist_first_choice must be true or false.')
+    return cfg, opening
+
 
 
 @contextmanager
@@ -67,7 +88,8 @@ def keep_awake(enabled):
 
 
 def log(message):
-    print(datetime.now(ZoneInfo('America/New_York')).strftime('%H:%M:%S'), message, flush=True)
+    stamp = datetime.now(OPENING.tzinfo) if OPENING else datetime.now().astimezone()
+    print(stamp.strftime('%H:%M:%S'), message, flush=True)
 
 
 def signed_in(page):
@@ -76,9 +98,9 @@ def signed_in(page):
     return bool(re.search(r'\bWelcome\s+\S+', page.locator('body').inner_text()))
 
 
-def quarter_is_q2(page):
-    # Do not confuse the upcoming Q2 notice on the Q1 home page with Q2.
-    return bool(re.match(r'^Q2 Fall 2026 Physical Education', page.title()))
+def correct_term(page):
+    # Use the title, never an upcoming-term notice in the page body.
+    return page.title().startswith(SETTINGS['term'] + ' Physical Education')
 
 
 def fields(page):
@@ -106,42 +128,46 @@ def guard(page):
         raise RuntimeError('Site verification or access block; complete manually. No retries.')
 
 
-def attempt(page, section, clock):
+def attempt(page, choice, waitlist=False):
+    section, clock = choice['section'], choice['time']
     link = page.get_by_role('link', name=section, exact=True)
     row = page.get_by_role('row').filter(has=link)
     if link.count() != 1 or row.count() != 1:
         raise RuntimeError(f'Cannot uniquely identify {section}.')
     cells = [x.strip() for x in row.locator('td').all_text_contents()]
-    if len(cells) != 9 or cells[0] != section or cells[3] != 'MW' or cells[4] != clock:
+    if len(cells) != 9 or cells[0] != section or cells[3] != choice['days'] or cells[4] != clock:
         raise RuntimeError(f'Unexpected section layout or schedule for {section}.')
-    if 'Skate, Beginner' not in cells[2]:
+    if cells[2] != choice['title']:
         raise RuntimeError('Course title mismatch.')
     if not cells[6].isdigit():
         raise RuntimeError('Cannot read available openings.')
-    if int(cells[6]) == 0:
+    if int(cells[6]) == 0 and not waitlist:
         log(f'{section} is full; trying the next choice.')
         return False
     link.click()
     page.get_by_role('heading', name=f'Course Section {section}', exact=True).wait_for()
     guard(page)
-    if not quarter_is_q2(page):
+    if not correct_term(page):
         raise RuntimeError('Wrong quarter on section detail page.')
     details = fields(page)
-    if details.get('Section ID') != section or details.get('Course Title') != 'Skate, Beginner':
+    if details.get('Section ID') != section or details.get('Course Title') != choice['title']:
         raise RuntimeError('Course detail mismatch.')
     schedule = details.get('Schedule', '')
-    if f'Mon, Wed {clock}' not in schedule:
+    if choice['detail_schedule'] not in schedule:
         raise RuntimeError('Detail schedule mismatch.')
     fee = details.get('Fee')
-    if fee != '$20.00':
+    if not fee or not re.fullmatch(r'\$[\d,]+\.\d{2}', fee) or Decimal(fee.replace('$', '').replace(',', '')) > Decimal(str(choice['max_fee'])):
         raise RuntimeError(f'Unexpected fee {fee!r}; complete manually.')
     # Do not accept legal agreements or select unexamined inputs.
     controls = page.locator('input:not([type="hidden"]):not([type="submit"]):not([type="button"]), select, textarea')
     if any(control.is_visible() for control in controls.all()):
         raise RuntimeError('A form needs input; complete manually.')
+    names = ('Register', 'Register for this Section', 'Register for Course', 'Add Course', 'Add Section')
+    if waitlist and int(cells[6]) == 0:
+        names += ('Join Waitlist', 'Join Wait List', 'Add to Waitlist', 'Add to Wait List', 'Waitlist')
     candidates = []
     for role in ('button', 'link'):
-        for name in ('Register', 'Register for this Section', 'Register for Course', 'Add Course', 'Add Section'):
+        for name in names:
             for control in page.get_by_role(role, name=name, exact=True).all():
                 if control.is_visible() and control.is_enabled():
                     candidates.append(control)
@@ -149,31 +175,48 @@ def attempt(page, section, clock):
         raise RuntimeError('Enrollment control is unfamiliar or unavailable; complete manually.')
     if re.search(r'by (?:clicking|registering)|I agree|terms and conditions|accept.*waiver', page.locator('body').inner_text(), re.I):
         raise RuntimeError('Agreement requires your review; complete manually.')
-    log(f'Attempting {section} ({clock}), $20 fee. Submitting once.')
+    log(f'Attempting {section} ({clock}), fee {fee}, waitlist allowed: {waitlist}. Submitting once.')
     candidates[0].click(no_wait_after=True)
     # A JS confirmation is left to the user. Never submit a second time.
     page.wait_for_timeout(1000)
     guard(page)
-    if page.get_by_role('heading', name=re.compile(r'^Q2 Fall 2026')).count() == 0:
+    if not correct_term(page):
         raise RuntimeError('Submission outcome is unknown; check browser before further action.')
     # Home status provides authoritative enrollment, not the section capacity.
     page.goto(HOME, wait_until='domcontentloaded')
     guard(page)
     status = fields(page)
-    if (quarter_is_q2(page) and status.get('Section ID') == section
+    if (correct_term(page) and status.get('Section ID') == section
             and re.fullmatch(r'Registered(?:\s*:?\s*)', status.get('Status', ''), re.I)):
         log(f'CONFIRMED: enrolled in {section}.')
         return True
-    raise RuntimeError('Enrollment not confirmed. Check the browser; no further submit will occur.')
+    if (waitlist and correct_term(page) and status.get('Section ID') == section
+            and re.fullmatch(r'Waitlist position\s*:\s*\d+', status.get('Status', ''), re.I)):
+        log(f'CONFIRMED: {section}, {status["Status"]}.')
+        return True
+    raise RuntimeError('Enrollment/waitlist not confirmed. Check the browser; no further submit will occur.')
 
 
 def main():
-    print('MIT PE bot v4 - macOS and Windows', flush=True)
+    global SETTINGS, OPENING
+    print('MIT PE bot v5 - configurable courses and waitlist fallback', flush=True)
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--arm', action='store_true', help='Actually attempt registration at opening time')
+    parser.add_argument('--config', type=Path, default=BASE / 'config.json')
+    parser.add_argument('--now', action='store_true', help='With --arm, attempt immediately instead of waiting')
     args = parser.parse_args()
-    if args.arm and datetime.now(OPENING.tzinfo) > OPENING:
-        parser.error('Opening time has passed. This dated script will not run late.')
+    if args.now and not args.arm:
+        parser.error('--now requires --arm')
+    try:
+        SETTINGS, OPENING = load_config(args.config)
+    except (ValueError, KeyError, OSError) as exc:
+        parser.error(str(exc))
+    log('Target term: ' + SETTINGS['term'])
+    for i, choice in enumerate(SETTINGS['choices'], 1):
+        log(f'{i}. {choice["section"]}: {choice["title"]}, {choice["days"]} {choice["time"]}, max fee ${choice["max_fee"]}')
+    log('First-choice waitlist fallback: ' + str(SETTINGS.get('waitlist_first_choice', False)))
+    if args.arm and not args.now and datetime.now(OPENING.tzinfo) > OPENING:
+        parser.error('Opening time has passed. Check config or use --arm --now explicitly.')
     from playwright.sync_api import sync_playwright
     with keep_awake(args.arm), sync_playwright() as pw:
         profile = BASE / 'mit-pe-local-profile'
@@ -205,29 +248,38 @@ def main():
             if not args.arm:
                 log('DRY RUN complete. No enrollment attempted. Re-run with --arm when ready.')
             else:
-                log(f'ARMED for {OPENING.isoformat()}; first PE.0612-1, then PE.0612-2.')
-                log('Keep this window open. Login may expire; check it again around 7:55 AM.')
-                while (remaining := (OPENING - datetime.now(OPENING.tzinfo)).total_seconds()) > 0:
+                log('ARMED for ' + ('immediate attempt' if args.now else OPENING.isoformat()))
+                log('Keep this window open. Recheck login shortly before the opening time.')
+                while not args.now and (remaining := (OPENING - datetime.now(OPENING.tzinfo)).total_seconds()) > 0:
                     page.wait_for_timeout(min(remaining, 1) * 1000)
                 deadline = time.monotonic() + 120
                 while True:
                     page.goto(HOME, wait_until='domcontentloaded')
                     guard(page)
                     existing = fields(page)
-                    if quarter_is_q2(page) and existing.get('Status'):
-                        raise RuntimeError('Q2 already has a registration or waitlist entry; check manually.')
+                    if correct_term(page) and existing.get('Status'):
+                        raise RuntimeError('Target term already has a registration or waitlist entry; check manually.')
                     open_list(page)
                     guard(page)
-                    if quarter_is_q2(page):
+                    if correct_term(page):
                         break
                     if time.monotonic() >= deadline:
-                        raise RuntimeError('Q2 has not appeared within two minutes. Complete manually.')
+                        raise RuntimeError('Target term has not appeared within two minutes. Complete manually.')
                     page.wait_for_timeout(2000)
-                for section, clock in CHOICES:
-                    if attempt(page, section, clock):
+                for choice in SETTINGS['choices']:
+                    if attempt(page, choice):
                         break
                 else:
-                    log('Both choices full. No waitlist enrollment attempted.')
+                    if SETTINGS.get('waitlist_first_choice', False):
+                        log('All choices full. Trying the first choice with waitlist allowed.')
+                        page.goto(HOME, wait_until='domcontentloaded')
+                        guard(page)
+                        if not correct_term(page) or fields(page).get('Status'):
+                            raise RuntimeError('Term changed or registration exists; check manually.')
+                        open_list(page)
+                        attempt(page, SETTINGS['choices'][0], waitlist=True)
+                    else:
+                        log('All choices full. Waitlist fallback disabled.')
         except Exception as exc:
             log(f'STOPPED: {exc}')
             print('\a', end='', flush=True)
